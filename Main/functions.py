@@ -10,6 +10,8 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime
+
+import datetime as dt
 #import plotly.graph_objects as go
 #from plotly.subplots import make_subplots
 import plotly.io as io
@@ -18,7 +20,7 @@ import plotly.express as px
 #import pyarrow.parquet as pq
 from pmdarima import auto_arima # for determining ARIMA orders
 from statsmodels.tsa.api import STLForecast,ARIMA
-import mysql.connector as connection_type2
+import mysql.connector as connection
 import pymysql
 
 ##########################################################################################################
@@ -31,13 +33,13 @@ You need two files:
     ###'TerminalProvinces.xlsx' Special cases 
 """
 # This section is for Ops forecast
-connection = pymysql.connect(host='localhost',
+connection_type2 = pymysql.connect(host='localhost',
                              user='root',        # update this one
                              password='123456',  # update this one
                              db='forecasting_schema')
-cursor = connection.cursor()
+cursor = connection_type2.cursor()
 
-mydb = connection_type2.connect(host="localhost", database = 'forecasting_schema',user="root", passwd="123456",use_pure=True)
+mydb = connection.connect(host="localhost", database = 'forecasting_schema',user="root", passwd="123456",use_pure=True,auth_plugin='mysql_native_password')
 
 ##########################################################################################################
 
@@ -68,9 +70,13 @@ def changing_column_names(df):
     
     
     for i in df.columns:
-        if i.lower() in ['calendardate','date','calendar date','induction date','edd','eid','expected delivery date']:
+        if i.lower() in ['calendardate','date','calendar date','induction date','edd','eid',
+                         'expected delivery date','stopeventdate']:
             df = df.rename(columns={i:'Date'})
-            df['Date'] = pd.to_datetime(df['Date'])
+            if df['Date'].dtypes=='datetime64[ns]' :
+                df['Date'] = pd.to_datetime(df['Date'])
+            else:
+                df = preprocessing_converting_ordinaldates(df)
             #df.set_index('Date',inplace=True)
         
         if i.lower() in ['week number','week','weeknumber']:
@@ -85,7 +91,7 @@ def changing_column_names(df):
             df = df.rename(columns={i:'Customer'})
             
         
-        if i.lower() in ['termnr','origindepotid',"terminal",'destdepotid','Terminal']:
+        if i.lower() in ['termnr','origindepotid',"terminal",'destdepotid','Terminal','stopeventterminal']:
             df = df.rename(columns={i:'Terminal'})
 
 
@@ -352,7 +358,7 @@ def sql_reading_table(sql_query,mydb=mydb):
     return df
 
 
-def sql_appending_to_table(df,table_name ='courierops' ,cursor=cursor,connection=connection):
+def sql_appending_to_table(df,table_name,cursor=cursor,connection=connection_type2):
     """ dataframe must have the same columns  and table_name is a string for example: table_name='fmr' """
     cols = "`,`".join([str(i) for i in df.columns.tolist()])
     for i,row in df.iterrows():
@@ -364,7 +370,7 @@ def sql_appending_to_table(df,table_name ='courierops' ,cursor=cursor,connection
         connection.commit()
 
 
-def sql_truncating_table(table_name,ask_user=1,cursor=cursor,connection=connection):
+def sql_truncating_table(table_name,ask_user=1,cursor=cursor,connection=connection_type2):
     """example: table_name = 'courierops' |
           ask_user=1 is just to make sure about removing data"""
     # Confirmation : Asking user 
@@ -384,8 +390,114 @@ def sql_truncating_table(table_name,ask_user=1,cursor=cursor,connection=connecti
     else:
         print('Go and eat somethig, You are tired :D')
     
-def sql_removing_from_table(query, cursor= cursor,connection = connection):
+def sql_removing_from_table(query, cursor= cursor,connection = connection_type2):
     """ query should be like this
     #query = "DELETE FROM `fmr_accuracy` where `fmr_accuracy`.`CalendarDate`>='%s'" %start """
     cursor.execute(query)
     connection.commit()
+    
+
+
+
+def preprocessing_courierops(df):
+    df = df.iloc[1:,:] # remove the first line :total row
+    df['Couriers/Day'] = df['Couriers/Day'].replace("-",0)
+    df['Kilometers'] = df['Kilometers'].replace("-",0)
+    terminal_list = sql_reading_table("select * from terminal_list")['Terminal'].sort_values()
+    terminal_list = terminal_list.reset_index(drop=True)
+    df = pd.merge(df,terminal_list,how='inner')
+    df['Total Del Stops'] = df['PCL Del Stops'] + df['Agent Del Stops']
+    df['Total PU Stops'] = df['PCL PU Stops'] + df['Agent PU Stops']
+    df['Total Del Pcs'] = df['PCL Del Pcs'] + df['Agent Del Pcs']
+    df['Total PU Pcs'] = df['PCL PU Pcs'] + df['Agent PU Pcs']
+    df['TOTAL STOPS'] = df['Total Del Stops'] + df['Total PU Stops']
+
+    df = df[['CalendarDate','Terminal','Total Del Stops','PCL Del Stops','Agent Del Stops', 
+                                    'Total Del Pcs','PCL Del Pcs','Agent Del Pcs',
+                                    'Total PU Stops','PCL PU Stops','Agent PU Stops',
+                                    'Total PU Pcs' ,'PCL PU Pcs','Agent PU Pcs',
+                                    'TOTAL STOPS',
+                                    'Courier AM Hours', 'Courier Delivery Hours','Courier Pickup Hours',
+                                    'Courier PM Hours', 'Courier Other Hours','Couriers/Day',
+                                    'Courier count worked', 'WorkingDays', 'Kilometers',
+                                    'AM Dock Hours', 'PM Dock Hours','Linehaul Hours', 
+         ]]
+    df = df.sort_values(['CalendarDate','Terminal'])
+    df.set_index('CalendarDate',inplace=True)
+    
+
+    return df
+
+
+def preprocessing_amazon(df,start,finish):
+    df = df.iloc[2:,:] # remove the first line -total row
+    df = changing_column_names(df)
+    
+    df = df.rename(columns={'Delivery Pieces':'Pieces','Delivery Stops':'Stops'})
+    df = df[['Date','Terminal','Tier2','Pieces','Stops']]
+    
+        #df['Date'] = pd.to_datetime(df['Date'])
+    df = df[~df['Terminal'].isin(['POR'])]
+    df['Terminal'] = df['Terminal'].astype('int64')
+
+    terminal_list = sql_reading_table("select * from terminal_list")['Terminal'].sort_values()
+    terminal_list = terminal_list.reset_index(drop=True)
+    df = pd.merge(df,terminal_list,how='inner')
+
+
+
+    #terminal_list = sql_reading_table("select * from terminal_list")['Terminal'].sort_values()
+    #terminal_list = terminal_list.reset_index(drop=True)
+    
+    #df = pd.merge(df,terminal_list,how='inner')
+
+    # Slice dates based on the interval
+    df = df[ (df['Date']>= start) & (df['Date']<=finish) ]
+
+    df = df.sort_values(['Date','Terminal'])
+    #df.set_index('Date',inplace=True)
+    return df
+
+def preprocessing_converting_ordinaldates(df):
+    df = df.dropna()
+    df['Date'] = df['Date'].astype('int64')
+    df['Date_new'] = df['Date'].apply(lambda x : datetime.fromordinal (   datetime(1900, 1, 1).toordinal() + x - 2    ).strftime("%m-%d-%Y") )
+    df = df.drop('Date',axis=1)
+    df = df.rename(columns={'Date_new':'Date'})
+    df['Date'] = pd.to_datetime(df['Date'])
+    
+
+    return df
+
+def preprocessing_forecast(df,amazon):
+    cols = df.columns
+    cols_new = [i.replace("."," ") for i in cols]
+    df.columns = cols_new
+    df = df.rename(columns = {'Calendar Date':'CalendarDate','Couriers per Day':'Couriers/Day'})
+
+    df['Agent Del Stops'] = df['Total Del Stops'] - df['PCL Del Stops']
+    df['Agent PU Stops'] = df['Total PU Stops'] - df['PCL PU Stops']
+    df['TOTAL STOPS'] = df['Total Del Stops'] + df['Total PU Stops']
+
+    df = df[['CalendarDate','Terminal','Total Del Stops','PCL Del Stops','Agent Del Stops', 
+                                        'Total Del Pcs','PCL Del Pcs','Agent Del Pcs',
+                                        'Total PU Stops','PCL PU Stops','Agent PU Stops',
+                                        'Total PU Pcs' ,'PCL PU Pcs','Agent PU Pcs',
+                                        'TOTAL STOPS',
+                                        'Courier AM Hours', 'Courier Delivery Hours','Courier Pickup Hours',
+                                        'Courier PM Hours', 'Courier Other Hours','Couriers/Day',
+                                        'AM Dock Hours', 'PM Dock Hours' 
+            ]]
+
+    df['CalendarDate'] = pd.to_datetime(df['CalendarDate'])
+    df = pd.merge(df,amazon,on=['CalendarDate','Terminal'],how='left')
+    df.set_index('CalendarDate',inplace=True)
+    df[' Amazon Forecast Pieces '] = df[' Amazon Forecast Pieces '].replace('-',0)
+    df[' Amazon Forecast Pieces '] = df[' Amazon Forecast Pieces '].astype('int64')
+    df = df.mask(df < 0, 0)
+    new_columns = df.columns
+    new_columns = ["Forecast-"+i for i in df.columns]
+    df.columns = new_columns
+    df = df.rename(columns = {'Forecast-Terminal':'Terminal'})
+
+    return df
